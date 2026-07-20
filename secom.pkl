@@ -1,0 +1,4 @@
+# This lines inside train_model.py create your pkl files!
+joblib.dump(rf_pipeline, 'production_rf_pipeline.pkl')
+joblib.dump(xgb_pipeline, 'production_xgb_pipeline.pkl')
+joblib.dump(test_data, 'test_dataset_cache.pkl')
