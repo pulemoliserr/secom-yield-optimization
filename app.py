@@ -14,11 +14,16 @@ one row per TEST-set wafer and columns:
     proba_rf   -> Tuned Random Forest's predicted P(defect) for that wafer
     proba_xgb  -> XGBoost's predicted P(defect) for that wafer          (optional)
 
-If that file isn't found, the app falls back to a small synthetic demo
-dataset so the UI is still fully explorable. See the bottom of this file
-for the two-line snippet that exports the real file from your notebook.
+Optionally also expects a `secom_model_params.json` file next to this file,
+describing each model's hyperparameters (see the export snippet at the
+bottom of this file). Without it, the app shows clearly-labelled demo
+values so the "Model Configuration" section is still explorable.
+
+If secom_test_predictions.csv isn't found, the app falls back to a small
+synthetic demo dataset so the UI is still fully explorable.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -29,10 +34,36 @@ import streamlit as st
 st.set_page_config(page_title="SECOM Yield Optimization Engine", page_icon="🏭", layout="wide")
 
 PREDICTIONS_FILE = Path(__file__).parent / "secom_test_predictions.csv"
+MODEL_PARAMS_FILE = Path(__file__).parent / "secom_model_params.json"
 
 MODEL_LABELS = {
     "proba_rf": "Tuned Random Forest",
     "proba_xgb": "XGBoost",
+}
+
+# Clearly-labelled placeholder hyperparameters, used only if secom_model_params.json
+# isn't found next to this file -- see load_model_params() and the export snippet
+# at the bottom of this file for how to generate the real one from your notebook.
+DEMO_MODEL_PARAMS = {
+    "proba_rf": {
+        "Algorithm": "Random Forest (scikit-learn)",
+        "n_estimators": 150,
+        "max_depth": 10,
+        "min_samples_split": 5,
+        "min_samples_leaf": 2,
+        "max_features": "sqrt",
+        "n_neighbors (imputer)": 5,
+        "random_state": 42,
+    },
+    "proba_xgb": {
+        "Algorithm": "XGBoost",
+        "n_estimators": 100,
+        "max_depth": 4,
+        "learning_rate": 0.05,
+        "subsample": 1.0,
+        "colsample_bytree": 1.0,
+        "random_state": 42,
+    },
 }
 
 
@@ -58,11 +89,37 @@ def load_predictions():
     return make_demo_predictions(), "demo data -- secom_test_predictions.csv not found next to app.py"
 
 
+@st.cache_data
+def load_model_params():
+    if MODEL_PARAMS_FILE.exists():
+        with open(MODEL_PARAMS_FILE) as f:
+            return json.load(f), "loaded from secom_model_params.json"
+    return DEMO_MODEL_PARAMS, "demo values (illustrative) -- secom_model_params.json not found next to app.py"
+
+
+def build_params_table(model_params: dict, available_models: dict) -> pd.DataFrame:
+    """One row per parameter, one column per available model, in the order
+    each parameter first appears (Algorithm/architecture fields first)."""
+    ordered_keys = []
+    for col in available_models:
+        for k in model_params.get(col, {}):
+            if k not in ordered_keys:
+                ordered_keys.append(k)
+    table = {
+        label: [str(model_params.get(col, {}).get(k, "\u2014")) for k in ordered_keys]
+        for col, label in available_models.items()
+    }
+    return pd.DataFrame(table, index=ordered_keys)
+
+
 df, data_source_note = load_predictions()
 available_models = {col: label for col, label in MODEL_LABELS.items() if col in df.columns}
 if not available_models:
     st.error("No probability columns found. Expected at least one of: " + ", ".join(MODEL_LABELS))
     st.stop()
+
+model_params, params_source_note = load_model_params()
+model_params = {col: params for col, params in model_params.items() if col in available_models}
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +249,17 @@ st.caption(
 )
 st.markdown("---")
 
+with st.expander("🔧 Model Configuration \u2014 Hyperparameters & Architecture", expanded=True):
+    params_df = build_params_table(model_params, available_models)
+    st.dataframe(params_df, use_container_width=True)
+    st.caption(
+        f"Data source: {params_source_note}. `n_estimators`, `max_depth`, and "
+        f"`min_samples_leaf` for the Random Forest -- and the equivalent XGBoost "
+        f"parameters -- were selected via cross-validated `RandomizedSearchCV` "
+        f"scored on Average Precision, not chosen by hand. The currently selected "
+        f"model in the sidebar is **{available_models[model_col]}**."
+    )
+
 left, right = st.columns([2.1, 1])
 
 with left:
@@ -301,3 +369,45 @@ st.table(pd.DataFrame({
         f"${current['cost']:,}",
     ],
 }).set_index("Metric"))
+
+
+# --------------------------------------------------------------------------- #
+# HOW TO EXPORT secom_model_params.json FROM YOUR NOTEBOOK
+# --------------------------------------------------------------------------- #
+# Add this to the corrected pipeline notebook, after Sections 15/16 have
+# produced `best_rf_pipeline` and `xgb_pipeline`, alongside the existing
+# secom_test_predictions.csv export -- then drop the resulting JSON file
+# next to app.py:
+#
+#   import json
+#
+#   def safe_get_params(pipeline, step_name, keys):
+#       if step_name not in pipeline.named_steps:
+#           return {}
+#       p = pipeline.named_steps[step_name].get_params()
+#       return {k: p.get(k) for k in keys if k in p}
+#
+#   rf_params = {"Algorithm": "Random Forest (scikit-learn)"}
+#   rf_params.update(safe_get_params(best_rf_pipeline, "rf", [
+#       "n_estimators", "max_depth", "min_samples_split",
+#       "min_samples_leaf", "max_features", "random_state",
+#   ]))
+#   rf_params.update(safe_get_params(best_rf_pipeline, "impute", ["n_neighbors"]))
+#   if "winsorize" in best_rf_pipeline.named_steps:
+#       w = best_rf_pipeline.named_steps["winsorize"]
+#       rf_params["winsorize_lower_quantile"] = w.lower_quantile
+#       rf_params["winsorize_upper_quantile"] = w.upper_quantile
+#
+#   xgb_params = {"Algorithm": "XGBoost"}
+#   xgb_params.update(safe_get_params(xgb_pipeline, "xgb", [
+#       "n_estimators", "max_depth", "learning_rate",
+#       "subsample", "colsample_bytree", "random_state",
+#   ]))
+#
+#   with open("secom_model_params.json", "w") as f:
+#       json.dump({"proba_rf": rf_params, "proba_xgb": xgb_params}, f, indent=2)
+#
+# `safe_get_params` skips a pipeline step entirely if it isn't present, so
+# this works whether Section 13's extended search (with its own winsorizer
+# and tunable imputer) was adopted or the simpler Section 12 pipeline was
+# kept -- no manual editing required either way.
