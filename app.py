@@ -129,6 +129,12 @@ def cost_curve(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: f
     return grid, costs
 
 
+def sweep_all_metrics(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: float):
+    grid = np.linspace(0.01, 0.99, 99)
+    rows = [metrics_at(y_true, proba, t, cost_fp, cost_fn) for t in grid]
+    return grid, pd.DataFrame(rows)
+
+
 def sweep_thresholds(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: float, min_recall: float = 0.0):
     grid = np.linspace(0.01, 0.99, 99)
     rows = [metrics_at(y_true, proba, t, cost_fp, cost_fn) for t in grid]
@@ -195,6 +201,7 @@ champion_sla = metrics_at(y_true, proba, best_t_sla, cost_fp, cost_fn)
 
 model_curves = {}
 all_metrics_at_current = {}
+full_sweeps = {}
 
 for col, label in available_models.items():
     p = df[col].to_numpy()
@@ -202,6 +209,7 @@ for col, label in available_models.items():
     at_current = metrics_at(y_true, p, threshold, cost_fp, cost_fn)
     model_curves[col] = {"label": label, "grid": g, "costs": c, "cost_at_current": at_current["cost"]}
     all_metrics_at_current[col] = at_current
+    _, full_sweeps[col] = sweep_all_metrics(y_true, p, cost_fp, cost_fn)
 
 cheapest_col = min(model_curves, key=lambda c: model_curves[c]["cost_at_current"])
 
@@ -250,7 +258,6 @@ with left:
         )
 
     # Central Financial Trajectory Graph
-    st.subheader("📈 Financial Trajectory Matrix: Cost vs. Threshold Sweep")
     curve = go.Figure()
     palette = {"proba_rf": "#1E2761", "proba_xgb": "#F5A623"}
     dash = {"proba_rf": "solid", "proba_xgb": "dash"}
@@ -262,11 +269,26 @@ with left:
         ))
     curve.add_vline(x=threshold, line_dash="dashdot", line_color="#C0392B", line_width=2,
                     annotation_text=f"Current threshold ({threshold:.2f})", annotation_position="top")
+    
     curve.update_layout(
-        height=420,
-        xaxis_title="Decision Threshold Boundary", yaxis_title="Total Financial Cost ($)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=10, r=10, t=40, b=10),
+        title=dict(
+            text="📈 Financial Trajectory Matrix: Cost vs. Threshold Sweep",
+            y=0.96,
+            x=0,
+            xanchor="left",
+            font=dict(size=18),
+        ),
+        height=450,
+        xaxis_title="Decision Threshold Boundary",
+        yaxis_title="Total Financial Cost ($)",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.22,
+            xanchor="left",
+            x=0,
+        ),
+        margin=dict(l=10, r=10, t=70, b=60),
     )
     st.plotly_chart(curve, use_container_width=True)
 
@@ -332,10 +354,23 @@ with right:
 
 st.markdown("---")
 
-# Side-by-Side Detailed Metrics Comparison Table
-st.markdown(f"**Detailed metrics comparison at t = {threshold:.2f}**")
+# --------------------------------------------------------------------------- #
+# All 7 Detailed Metrics Comparison Table
+# --------------------------------------------------------------------------- #
+st.markdown(f"### 📋 All 7 Key Metrics Comparison at t = {threshold:.2f}")
 
-metrics_table_data = {"Metric": ["Recall", "Precision", "Specificity", "F1 Score", "Total Cost"]}
+metrics_table_data = {
+    "Metric": [
+        "Recall (Defect Catch Rate)", 
+        "Precision (True Defect Share)", 
+        "Specificity (True Normal Share)", 
+        "F1 Score", 
+        "False Alarms (FP)", 
+        "Missed Defects (FN)", 
+        "Total Financial Cost ($)"
+    ]
+}
+
 for col, label in available_models.items():
     m = all_metrics_at_current[col]
     metrics_table_data[label] = [
@@ -343,10 +378,85 @@ for col, label in available_models.items():
         f"{m['precision']*100:.1f}%",
         f"{m['specificity']*100:.1f}%",
         f"{m['f1']*100:.1f}%",
+        f"{m['fp']:,}",
+        f"{m['fn']:,}",
         f"${m['cost']:,}",
     ]
 
 st.table(pd.DataFrame(metrics_table_data).set_index("Metric"))
+
+# --------------------------------------------------------------------------- #
+# Metric Variation Across Thresholds Chart
+# --------------------------------------------------------------------------- #
+st.markdown("### 📊 Metric Dynamics Across Decision Threshold Sweeps")
+
+selected_metric = st.selectbox(
+    "Select Metric to Visualize Across Thresholds (t):",
+    options=["recall", "precision", "specificity", "f1", "fp", "fn", "cost", "All Normalized Metrics (0-1)"],
+    format_func=lambda x: {
+        "recall": "Recall",
+        "precision": "Precision",
+        "specificity": "Specificity",
+        "f1": "F1 Score",
+        "fp": "False Alarms (FP)",
+        "fn": "Missed Defects (FN)",
+        "cost": "Total Financial Cost ($)",
+        "All Normalized Metrics (0-1)": "All Metrics Combined (0 to 1 Scale)",
+    }.get(x, x),
+)
+
+metric_fig = go.Figure()
+
+if selected_metric == "All Normalized Metrics (0-1)":
+    df_active = full_sweeps[model_col]
+    metric_colors = {
+        "recall": "#27AE60",
+        "precision": "#2980B9",
+        "specificity": "#8E44AD",
+        "f1": "#F39C12"
+    }
+    for m_key, m_color in metric_colors.items():
+        metric_fig.add_trace(go.Scatter(
+            x=grid, y=df_active[m_key], mode="lines", name=m_key.capitalize(),
+            line=dict(color=m_color, width=2.5)
+        ))
+    chart_title = f"Rate Metrics Trade-off for {available_models[model_col]}"
+    y_label = "Metric Value (0.0 - 1.0)"
+else:
+    for col, label in available_models.items():
+        df_sweep = full_sweeps[col]
+        metric_fig.add_trace(go.Scatter(
+            x=grid, y=df_sweep[selected_metric], mode="lines", name=label,
+            line=dict(color=palette.get(col, "#6B7280"), width=3, dash=dash.get(col, "solid"))
+        ))
+    chart_title = f"{selected_metric.capitalize()} Trajectory Across Thresholds"
+    y_label = selected_metric.upper() if selected_metric in ["fp", "fn"] else selected_metric.capitalize()
+
+metric_fig.add_vline(x=threshold, line_dash="dashdot", line_color="#C0392B", line_width=2,
+                     annotation_text=f"Current t ({threshold:.2f})", annotation_position="top")
+
+metric_fig.update_layout(
+    title=dict(
+        text=chart_title,
+        y=0.96,
+        x=0,
+        xanchor="left",
+        font=dict(size=18),
+    ),
+    height=450,
+    xaxis_title="Decision Threshold (t)",
+    yaxis_title=y_label,
+    legend=dict(
+        orientation="h",
+        yanchor="top",
+        y=-0.22,
+        xanchor="left",
+        x=0,
+    ),
+    margin=dict(l=10, r=10, t=70, b=60),
+)
+
+st.plotly_chart(metric_fig, use_container_width=True)
 
 # --------------------------------------------------------------------------- #
 # Base Section: Hyperparameters Collapsible Expander
