@@ -1,178 +1,303 @@
-# app.py
-import streamlit as st
+"""
+SECOM Semiconductor Yield Optimization Engine
+-----------------------------------------------
+Interactive dashboard for exploring how the classification threshold and
+the Type I / Type II cost assumptions change a model's confusion matrix,
+recall, and total business cost -- without retraining anything.
+
+Run with:
+    streamlit run app.py
+
+Expects a CSV called `secom_test_predictions.csv` next to this file, with
+one row per TEST-set wafer and columns:
+    y_test     -> true label, 0 = pass, 1 = defect
+    proba_rf   -> Tuned Random Forest's predicted P(defect) for that wafer
+    proba_xgb  -> XGBoost's predicted P(defect) for that wafer          (optional)
+
+If that file isn't found, the app falls back to a small synthetic demo
+dataset so the UI is still fully explorable. See the bottom of this file
+for the two-line snippet that exports the real file from your notebook.
+"""
+
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import joblib
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix
+import plotly.graph_objects as go
+import streamlit as st
 
-st.set_page_config(
-    page_title="SECOM Yield Optimization Cockpit", 
-    page_icon="🏭", 
-    layout="wide"
-)
+st.set_page_config(page_title="SECOM Yield Optimization Engine", page_icon="🏭", layout="wide")
 
-# --- LOAD CACHED PRODUCTION MODEL ARTIFACTS ---
-@st.cache_resource
-def load_production_assets():
-    rf_pipe = joblib.load('production_rf_pipeline.pkl')
-    xgb_pipe = joblib.load('production_xgb_pipeline.pkl')
-    test_cache = joblib.load('test_dataset_cache.pkl')
-    return rf_pipe, xgb_pipe, test_cache['X_test'], test_cache['y_test']
+PREDICTIONS_FILE = Path(__file__).parent / "secom_test_predictions.csv"
 
-try:
-    rf_pipeline, xgb_pipeline, X_test, y_test = load_production_assets()
-    y_test_binary = (y_test == 1).astype(int)
-except FileNotFoundError:
-    st.error("🚨 Model artifacts missing! Please run `python train_model.py` first to generate pipeline binaries.")
+MODEL_LABELS = {
+    "proba_rf": "Tuned Random Forest",
+    "proba_xgb": "XGBoost",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Data loading
+# --------------------------------------------------------------------------- #
+@st.cache_data
+def make_demo_predictions(seed: int = 42, n: int = 314, defect_rate: float = 0.0669) -> pd.DataFrame:
+    """Synthetic stand-in so the dashboard is explorable before you've
+    exported real predictions. Shaped like the SECOM test partition
+    (roughly 6.7% defect rate) with imperfect-but-informative scores."""
+    rng = np.random.default_rng(seed)
+    y = (rng.random(n) < defect_rate).astype(int)
+    proba_rf = np.clip(rng.beta(2, 22, n) + y * rng.beta(3, 4, n) * 0.6, 0, 1)
+    proba_xgb = np.clip(rng.beta(2, 19, n) + y * rng.beta(3, 3.5, n) * 0.55, 0, 1)
+    return pd.DataFrame({"y_test": y, "proba_rf": proba_rf, "proba_xgb": proba_xgb})
+
+
+@st.cache_data
+def load_predictions():
+    if PREDICTIONS_FILE.exists():
+        return pd.read_csv(PREDICTIONS_FILE), "loaded from secom_test_predictions.csv"
+    return make_demo_predictions(), "demo data -- secom_test_predictions.csv not found next to app.py"
+
+
+df, data_source_note = load_predictions()
+available_models = {col: label for col, label in MODEL_LABELS.items() if col in df.columns}
+if not available_models:
+    st.error("No probability columns found. Expected at least one of: " + ", ".join(MODEL_LABELS))
     st.stop()
 
-# --- BUSINESS RISK VARIABLES ---
-COST_FP = 100
-COST_FN = 400
 
+# --------------------------------------------------------------------------- #
+# Cost / metric helpers
+# --------------------------------------------------------------------------- #
+def confusion_counts(y_true: np.ndarray, proba: np.ndarray, threshold: float) -> dict:
+    pred = (proba >= threshold).astype(int)
+    tn = int(((pred == 0) & (y_true == 0)).sum())
+    fp = int(((pred == 1) & (y_true == 0)).sum())
+    fn = int(((pred == 0) & (y_true == 1)).sum())
+    tp = int(((pred == 1) & (y_true == 1)).sum())
+    return {"tn": tn, "fp": fp, "fn": fn, "tp": tp}
+
+
+def metrics_at(y_true: np.ndarray, proba: np.ndarray, threshold: float, cost_fp: float, cost_fn: float) -> dict:
+    c = confusion_counts(y_true, proba, threshold)
+    tn, fp, fn, tp = c["tn"], c["fp"], c["fn"], c["tp"]
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    cost = fp * cost_fp + fn * cost_fn
+    return {**c, "recall": recall, "precision": precision, "specificity": specificity, "f1": f1, "cost": cost}
+
+
+def cost_curve(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: float) -> tuple:
+    """Total cost at every candidate threshold for ONE model -- used to plot
+    multiple models' curves on the same chart."""
+    grid = np.linspace(0.01, 0.99, 99)
+    costs = np.array([metrics_at(y_true, proba, t, cost_fp, cost_fn)["cost"] for t in grid])
+    return grid, costs
+
+
+def sweep_thresholds(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: float,
+                      min_recall: float = 0.0):
+    """Total cost at every candidate threshold, plus the cheapest threshold
+    (a) unconstrained and (b) subject to a minimum-recall SLA."""
+    grid = np.linspace(0.01, 0.99, 99)
+    rows = [metrics_at(y_true, proba, t, cost_fp, cost_fn) for t in grid]
+    costs = np.array([r["cost"] for r in rows])
+    recalls = np.array([r["recall"] for r in rows])
+
+    best_idx = int(np.argmin(costs))
+
+    feasible = np.where(recalls >= min_recall)[0]
+    if len(feasible) > 0:
+        best_feasible_idx = feasible[np.argmin(costs[feasible])]
+    else:
+        best_feasible_idx = best_idx  # no threshold meets the SLA; fall back
+
+    return grid, costs, recalls, grid[best_idx], grid[best_feasible_idx]
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar controls
+# --------------------------------------------------------------------------- #
+with st.sidebar:
+    st.markdown("### 🎛️ Simulation Control Tower")
+    st.divider()
+
+    model_col = st.selectbox(
+        "Choose Tournament Model:",
+        options=list(available_models.keys()),
+        format_func=lambda c: available_models[c],
+    )
+
+    threshold = st.slider("Adjust Classification Threshold:", 0.0, 1.0, 0.42, 0.01)
+
+    st.caption(
+        "**Threshold relevance:** lowering it catches more defects (higher "
+        "recall) but raises false alarms; raising it does the reverse. "
+        "There is no threshold that improves both at once -- the point below "
+        "is chosen by minimizing total cost, not by eye."
+    )
+
+    st.divider()
+    st.markdown("**Cost Parameters**")
+    cost_fp = st.number_input("Cost per False Alarm (Type I)", min_value=1, value=100, step=10)
+    cost_fn = st.number_input("Cost per Missed Defect (Type II)", min_value=1, value=400, step=10)
+
+    st.divider()
+    st.markdown("**Business Constraint**")
+    min_recall_pct = st.slider("Minimum Required Recall (SLA)", 0, 100, 0, 5,
+                                help="Restrict the 'cheapest threshold' search to thresholds that still "
+                                     "catch at least this share of true defects.")
+
+    st.divider()
+    st.caption(f"Data source: {data_source_note}")
+
+
+# --------------------------------------------------------------------------- #
+# Compute
+# --------------------------------------------------------------------------- #
+y_true = df["y_test"].to_numpy()
+proba = df[model_col].to_numpy()
+
+current = metrics_at(y_true, proba, threshold, cost_fp, cost_fn)
+grid, costs, recalls, best_t, best_t_sla = sweep_thresholds(
+    y_true, proba, cost_fp, cost_fn, min_recall=min_recall_pct / 100
+)
+champion = metrics_at(y_true, proba, best_t, cost_fp, cost_fn)
+champion_sla = metrics_at(y_true, proba, best_t_sla, cost_fp, cost_fn)
+
+# Cost curve + current-threshold cost for EVERY available model, not just the
+# one selected in the sidebar -- this is what powers the comparison chart.
+model_curves = {}
+for col, label in available_models.items():
+    p = df[col].to_numpy()
+    g, c = cost_curve(y_true, p, cost_fp, cost_fn)
+    at_current = metrics_at(y_true, p, threshold, cost_fp, cost_fn)
+    model_curves[col] = {"label": label, "grid": g, "costs": c, "cost_at_current": at_current["cost"]}
+
+# Whichever model is cheaper AT THE CURRENT THRESHOLD -- recomputed on every
+# slider move, so this label tracks the live comparison rather than a fixed,
+# one-time winner.
+cheapest_col = min(model_curves, key=lambda c: model_curves[c]["cost_at_current"])
+
+
+# --------------------------------------------------------------------------- #
+# Header
+# --------------------------------------------------------------------------- #
 st.title("🏭 SECOM Semiconductor Yield Optimization Engine")
-st.markdown("Operational evaluation dashboard using real-time inference across out-of-sample manufacturing runs.")
-
-# --- SIDEBAR STYLE FIX & CONTROL PANEL ---
-# This CSS strip removes the default massive top padding inside the sidebar container
-st.markdown(
-    """
-    <style>
-    [data-testid="stSidebarUserContent"] {
-        padding-top: 1rem !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
+st.caption(
+    "Operational evaluation dashboard driven by cached out-of-sample predictions -- "
+    "moving the threshold or cost parameters recomputes everything below instantly, "
+    "with no retraining involved."
 )
+st.markdown("---")
 
-st.sidebar.markdown("### 🕹️ Simulation Control Tower")
-st.sidebar.markdown("---")
+left, right = st.columns([2.1, 1])
 
-selected_model = st.sidebar.selectbox("Choose Tournament Model:", ["Tuned Random Forest", "Optimized XGBoost"])
+with left:
+    st.subheader(f"⚔️ Interactive Arena: {available_models[model_col]}")
 
-slider_threshold = st.sidebar.slider(
-    "Adjust Classification Threshold:", 
-    min_value=0.05, max_value=0.95, value=0.42, step=0.01
-)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "**Threshold Relevance:** "
-    "In data science, this trades off Precision vs. Recall by shifting the decision boundary. "
-    "In business terms, lowering it catches more defects to reduce escape leakage, but spikes costly false alarms that halt production."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.info(f"**Cost Parameters:**\n* 🔴 Missed Defect (FN): **${COST_FN}**\n* 🟡 False Alarm (FP): **${COST_FP}**")
-
-# --- INFERENCE RUNTIME EVALUATION ---
-proba_rf = rf_pipeline.predict_proba(X_test)[:, 1]
-proba_xgb = xgb_pipeline.predict_proba(X_test)[:, 1]
-
-active_proba = proba_rf if selected_model == "Tuned Random Forest" else proba_xgb
-pred_sim = (active_proba >= slider_threshold).astype(int)
-
-# Matrix Compilations
-tn_sim, fp_sim, fn_sim, tp_sim = confusion_matrix(y_test_binary, pred_sim).ravel()
-cost_sim = (fp_sim * COST_FP) + (fn_sim * COST_FN)
-recall_sim = (tp_sim / (tp_sim + fn_sim)) * 100 if (tp_sim + fn_sim) > 0 else 0.0
-
-# Fixed Champion References
-tn_champ, fp_champ, fn_champ, tp_champ = 272, 21, 15, 6
-cost_champ = 8100
-recall_champ = 28.57
-
-# Helper for matrices with dynamic size scaling
-def draw_matrix(tn, fp, fn, tp, figsize=(4.5, 3.5)):
-    fig, ax = plt.subplots(figsize=figsize)
-    sns.heatmap([[tn, fp], [fn, tp]], annot=True, fmt="d", cmap="Blues", cbar=False,
-                xticklabels=["Pass", "Fail"], yticklabels=["Actual Normal", "Actual Defect"],
-                annot_kws={"size": 13, "weight": "bold"}, ax=ax)
-    plt.tight_layout()
-    return fig
-
-# ==========================================
-# 4. RENDER DASHBOARD LAYOUT (OPTIMIZED HORIZONTAL EXPANSION)
-# ==========================================
-st.markdown(
-    """
-    <style>
-    .cream-box {
-        background-color: #FFFDD0; /* Soft Cream */
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 5px solid #D4AF37; /* Gold accent line */
-        margin-top: 10px;
-        color: #333333;
-    }
-    .cream-box h3, .cream-box h4 {
-        color: #111111 !important;
-        margin-top: 0px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-# [Left Spacer, Center Stage, Middle Divider, Extended Right Sidebar]
-col_space1, col_center, col_divide, col_right = st.columns([0.1, 1.8, 0.3, 0.8])
-
-# --- LEFT MARGIN BUFFER ---
-with col_space1:
-    st.write("")
-
-# --- MAIN CENTER STAGE: LIVE SIMULATOR TOURNAMENT ---
-with col_center:
-    st.subheader(f"⚔️ Interactive Arena: {selected_model}")
-    
     m1, m2 = st.columns(2)
-    m1.metric("Simulated Business Cost", f"${cost_sim:,}", delta=f"${cost_sim - cost_champ:,} vs Champion", delta_color="inverse")
-    m2.metric("Recall (Defect Catch Rate)", f"{recall_sim:.1f}%")
-    
-    st.pyplot(draw_matrix(tn_sim, fp_sim, fn_sim, tp_sim, figsize=(5.5, 3.8)))
+    delta_cost = current["cost"] - champion["cost"]
+    m1.metric(
+        "Simulated Business Cost", f"${current['cost']:,}",
+        delta=f"${delta_cost:+,} vs cost-optimal threshold", delta_color="inverse",
+    )
+    m2.metric("Recall (Defect Catch Rate)", f"{current['recall']*100:.1f}%")
 
-# --- MIDDLE DIVIDER ---
-with col_divide:
-    st.write("")
+    st.subheader("📈 Financial Trajectory Matrix: Cost vs. Threshold Sweep")
 
-# --- RIGHT COLUMN: EXTENDED PRODUCTION CHAMPION ---
-with col_right:
+    curve = go.Figure()
+    palette = {"proba_rf": "#1E2761", "proba_xgb": "#F5A623"}
+    dash = {"proba_rf": "solid", "proba_xgb": "dash"}
+    for col, mc in model_curves.items():
+        name = mc["label"] + ("  (cheaper now)" if col == cheapest_col and len(model_curves) > 1 else "")
+        curve.add_trace(go.Scatter(
+            x=mc["grid"], y=mc["costs"], mode="lines", name=name,
+            line=dict(color=palette.get(col, "#6B7280"), width=3, dash=dash.get(col, "solid")),
+        ))
+    curve.add_vline(x=threshold, line_dash="dashdot", line_color="#C0392B", line_width=2,
+                     annotation_text=f"Current threshold ({threshold:.2f})", annotation_position="top")
+    curve.update_layout(
+        height=420,
+        xaxis_title="Decision Threshold Boundary", yaxis_title="Total Financial Cost ($)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    st.plotly_chart(curve, use_container_width=True)
+
+    # Live cost of each model at exactly the current threshold -- updates on every slider move.
+    cost_cols = st.columns(len(model_curves))
+    for i, (col, mc) in enumerate(model_curves.items()):
+        is_cheapest = col == cheapest_col and len(model_curves) > 1
+        cost_cols[i].metric(
+            f"{mc['label']} cost @ t={threshold:.2f}",
+            f"${mc['cost_at_current']:,}",
+            delta="cheaper" if is_cheapest else None,
+            delta_color="normal",
+        )
+
+    with st.expander("📊 Confusion matrix for the selected model", expanded=False):
+        cm = [[current["tn"], current["fp"]], [current["fn"], current["tp"]]]
+        fig = go.Figure(data=go.Heatmap(
+            z=cm,
+            x=["Predicted Normal", "Predicted Defect"],
+            y=["Actual Normal", "Actual Defect"],
+            colorscale=[[0, "#EAF0FB"], [1, "#1E2761"]],
+            showscale=False, text=cm, texttemplate="%{text}", textfont={"size": 22},
+        ))
+        fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_autorange="reversed")
+        st.plotly_chart(fig, use_container_width=True)
+
+with right:
     st.markdown(
         f"""
-        <div class="cream-box">
-            <h3>🏆 Production Champion</h3>
-            <p>Balancing asymmetric manufacturing penalties requires tracking strict floor limits:</p>
-            <ul>
-                <li><strong>Floor Cost:</strong> ${cost_champ:,}</li>
-                <li><strong>Baseline Recall:</strong> {recall_champ:.1f}%</li>
-                <li><strong>Cost-Optimized Threshold:</strong><br>t = 0.420</li>
-            </ul>
+        <div style="background:#FDF6D8;padding:1.1rem 1.3rem;border-radius:0.6rem;
+                    border-left:5px solid #E8B923;">
+        <h4 style="margin-top:0;">🏆 Production Champion</h4>
+        <p style="font-size:0.9rem;">Cost-minimizing threshold found by sweeping this
+        model's probabilities against your current cost parameters.</p>
+        <ul style="font-size:0.9rem;">
+            <li><b>Champion cost:</b> ${champion['cost']:,}</li>
+            <li><b>Champion recall:</b> {champion['recall']*100:.1f}%</li>
+            <li><b>Cost-optimized threshold:</b> t = {best_t:.3f}</li>
+        </ul>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
-    
-    st.write("")
-    st.markdown("**Locked Target Distribution:**")
-    st.pyplot(draw_matrix(tn_champ, fp_champ, fn_champ, tp_champ, figsize=(3.4, 2.2)))
-    
-    st.info(f"💡 **Note:** Standard metrics like Youden's J assume symmetric errors. By using a cost-optimized threshold framework instead, we actively protect the assembly line bottom line.")
-# --- BOTTOM PROFILE LINE TOURNAMENT ---
-st.markdown("---")
-st.subheader("📈 Financial Trajectory Matrix: Cost vs. Threshold Sweep")
-th_space = np.linspace(0.05, 0.95, 50)
-curve_rf = [confusion_matrix(y_test_binary, (proba_rf >= t).astype(int)).ravel()[1]*100 + confusion_matrix(y_test_binary, (proba_rf >= t).astype(int)).ravel()[2]*400 for t in th_space]
-curve_xgb = [confusion_matrix(y_test_binary, (proba_xgb >= t).astype(int)).ravel()[1]*100 + confusion_matrix(y_test_binary, (proba_xgb >= t).astype(int)).ravel()[2]*400 for t in th_space]
 
-fig_curve, ax = plt.subplots(figsize=(10, 3.0))
-ax.plot(th_space, curve_rf, label="Random Forest (Champion)", color="#1f77b4", linewidth=2.5)
-ax.plot(th_space, curve_xgb, label="XGBoost", color="#ff7f0e", linestyle="--")
-ax.axvline(slider_threshold, color="red", linestyle="-.", linewidth=1.5, label=f"Simulator Marker ({slider_threshold:.2f})")
-ax.set_xlabel("Decision Threshold Boundary")
-ax.set_ylabel("Total Financial Cost ($)")
-ax.legend(loc="upper right")
-ax.grid(True, alpha=0.3)
-st.pyplot(fig_curve)
+    if min_recall_pct > 0:
+        st.markdown(
+            f"""
+            <div style="background:#EAF6F2;padding:1.1rem 1.3rem;border-radius:0.6rem;
+                        border-left:5px solid #00A896;margin-top:0.8rem;">
+            <h4 style="margin-top:0;">🎯 Cheapest at {min_recall_pct}% Recall SLA</h4>
+            <ul style="font-size:0.9rem;">
+                <li><b>Cost:</b> ${champion_sla['cost']:,}</li>
+                <li><b>Recall achieved:</b> {champion_sla['recall']*100:.1f}%</li>
+                <li><b>Threshold:</b> t = {best_t_sla:.3f}</li>
+            </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("#####")
+    st.markdown("**Class distribution in this test set**")
+    dist = pd.DataFrame({
+        "Class": ["Normal", "Defect"],
+        "Count": [int((y_true == 0).sum()), int((y_true == 1).sum())],
+    }).set_index("Class")
+    st.bar_chart(dist, use_container_width=True, color="#1E2761")
+
+st.markdown("---")
+st.markdown("**Detailed metrics at the current threshold**")
+st.table(pd.DataFrame({
+    "Metric": ["Recall", "Precision", "Specificity", "F1 Score", "Total cost"],
+    "Value": [
+        f"{current['recall']*100:.1f}%", f"{current['precision']*100:.1f}%",
+        f"{current['specificity']*100:.1f}%", f"{current['f1']*100:.1f}%",
+        f"${current['cost']:,}",
+    ],
+}).set_index("Metric"))
