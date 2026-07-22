@@ -7,20 +7,6 @@ recall, and total business cost -- without retraining anything.
 
 Run with:
     streamlit run app.py
-
-Expects a CSV called `secom_test_predictions.csv` next to this file, with
-one row per TEST-set wafer and columns:
-    y_test     -> true label, 0 = pass, 1 = defect
-    proba_rf   -> Tuned Random Forest's predicted P(defect) for that wafer
-    proba_xgb  -> XGBoost's predicted P(defect) for that wafer          (optional)
-
-Optionally also expects a `secom_model_params.json` file next to this file,
-describing each model's hyperparameters (see the export snippet at the
-bottom of this file). Without it, the app shows clearly-labelled demo
-values so the "Model Configuration" section is still explorable.
-
-If secom_test_predictions.csv isn't found, the app falls back to a small
-synthetic demo dataset so the UI is still fully explorable.
 """
 
 import json
@@ -41,9 +27,6 @@ MODEL_LABELS = {
     "proba_xgb": "XGBoost",
 }
 
-# Clearly-labelled placeholder hyperparameters, used only if secom_model_params.json
-# isn't found next to this file -- see load_model_params() and the export snippet
-# at the bottom of this file for how to generate the real one from your notebook.
 DEMO_MODEL_PARAMS = {
     "proba_rf": {
         "Algorithm": "Random Forest (scikit-learn)",
@@ -68,13 +51,10 @@ DEMO_MODEL_PARAMS = {
 
 
 # --------------------------------------------------------------------------- #
-# Data loading
+# Data loading & Caching
 # --------------------------------------------------------------------------- #
 @st.cache_data
 def make_demo_predictions(seed: int = 42, n: int = 314, defect_rate: float = 0.0669) -> pd.DataFrame:
-    """Synthetic stand-in so the dashboard is explorable before you've
-    exported real predictions. Shaped like the SECOM test partition
-    (roughly 6.7% defect rate) with imperfect-but-informative scores."""
     rng = np.random.default_rng(seed)
     y = (rng.random(n) < defect_rate).astype(int)
     proba_rf = np.clip(rng.beta(2, 22, n) + y * rng.beta(3, 4, n) * 0.6, 0, 1)
@@ -98,8 +78,6 @@ def load_model_params():
 
 
 def build_params_table(model_params: dict, available_models: dict) -> pd.DataFrame:
-    """One row per parameter, one column per available model, in the order
-    each parameter first appears (Algorithm/architecture fields first)."""
     ordered_keys = []
     for col in available_models:
         for k in model_params.get(col, {}):
@@ -123,7 +101,7 @@ model_params = {col: params for col, params in model_params.items() if col in av
 
 
 # --------------------------------------------------------------------------- #
-# Cost / metric helpers
+# Cost & Metric Calculations
 # --------------------------------------------------------------------------- #
 def confusion_counts(y_true: np.ndarray, proba: np.ndarray, threshold: float) -> dict:
     pred = (proba >= threshold).astype(int)
@@ -146,17 +124,12 @@ def metrics_at(y_true: np.ndarray, proba: np.ndarray, threshold: float, cost_fp:
 
 
 def cost_curve(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: float) -> tuple:
-    """Total cost at every candidate threshold for ONE model -- used to plot
-    multiple models' curves on the same chart."""
     grid = np.linspace(0.01, 0.99, 99)
     costs = np.array([metrics_at(y_true, proba, t, cost_fp, cost_fn)["cost"] for t in grid])
     return grid, costs
 
 
-def sweep_thresholds(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: float,
-                      min_recall: float = 0.0):
-    """Total cost at every candidate threshold, plus the cheapest threshold
-    (a) unconstrained and (b) subject to a minimum-recall SLA."""
+def sweep_thresholds(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost_fn: float, min_recall: float = 0.0):
     grid = np.linspace(0.01, 0.99, 99)
     rows = [metrics_at(y_true, proba, t, cost_fp, cost_fn) for t in grid]
     costs = np.array([r["cost"] for r in rows])
@@ -168,13 +141,13 @@ def sweep_thresholds(y_true: np.ndarray, proba: np.ndarray, cost_fp: float, cost
     if len(feasible) > 0:
         best_feasible_idx = feasible[np.argmin(costs[feasible])]
     else:
-        best_feasible_idx = best_idx  # no threshold meets the SLA; fall back
+        best_feasible_idx = best_idx
 
     return grid, costs, recalls, grid[best_idx], grid[best_feasible_idx]
 
 
 # --------------------------------------------------------------------------- #
-# Sidebar controls
+# Sidebar Controls
 # --------------------------------------------------------------------------- #
 with st.sidebar:
     st.markdown("### 🎛️ Simulation Control Tower")
@@ -190,9 +163,7 @@ with st.sidebar:
 
     st.caption(
         "**Threshold relevance:** lowering it catches more defects (higher "
-        "recall) but raises false alarms; raising it does the reverse. "
-        "There is no threshold that improves both at once -- the point below "
-        "is chosen by minimizing total cost, not by eye."
+        "recall) but raises false alarms; raising it does the reverse."
     )
 
     st.divider()
@@ -203,15 +174,14 @@ with st.sidebar:
     st.divider()
     st.markdown("**Business Constraint**")
     min_recall_pct = st.slider("Minimum Required Recall (SLA)", 0, 100, 0, 5,
-                                help="Restrict the 'cheapest threshold' search to thresholds that still "
-                                     "catch at least this share of true defects.")
+                                help="Restrict the 'cheapest threshold' search to thresholds that still catch at least this share of true defects.")
 
     st.divider()
     st.caption(f"Data source: {data_source_note}")
 
 
 # --------------------------------------------------------------------------- #
-# Compute
+# Core Computation
 # --------------------------------------------------------------------------- #
 y_true = df["y_test"].to_numpy()
 proba = df[model_col].to_numpy()
@@ -223,23 +193,21 @@ grid, costs, recalls, best_t, best_t_sla = sweep_thresholds(
 champion = metrics_at(y_true, proba, best_t, cost_fp, cost_fn)
 champion_sla = metrics_at(y_true, proba, best_t_sla, cost_fp, cost_fn)
 
-# Cost curve + current-threshold cost for EVERY available model, not just the
-# one selected in the sidebar -- this is what powers the comparison chart.
 model_curves = {}
+all_metrics_at_current = {}
+
 for col, label in available_models.items():
     p = df[col].to_numpy()
     g, c = cost_curve(y_true, p, cost_fp, cost_fn)
     at_current = metrics_at(y_true, p, threshold, cost_fp, cost_fn)
     model_curves[col] = {"label": label, "grid": g, "costs": c, "cost_at_current": at_current["cost"]}
+    all_metrics_at_current[col] = at_current
 
-# Whichever model is cheaper AT THE CURRENT THRESHOLD -- recomputed on every
-# slider move, so this label tracks the live comparison rather than a fixed,
-# one-time winner.
 cheapest_col = min(model_curves, key=lambda c: model_curves[c]["cost_at_current"])
 
 
 # --------------------------------------------------------------------------- #
-# Header
+# Header Section
 # --------------------------------------------------------------------------- #
 st.title("🏭 SECOM Semiconductor Yield Optimization Engine")
 st.caption(
@@ -249,32 +217,40 @@ st.caption(
 )
 st.markdown("---")
 
-with st.expander("🔧 Model Configuration \u2014 Hyperparameters & Architecture", expanded=True):
-    params_df = build_params_table(model_params, available_models)
-    st.dataframe(params_df, use_container_width=True)
-    st.caption(
-        f"Data source: {params_source_note}. `n_estimators`, `max_depth`, and "
-        f"`min_samples_leaf` for the Random Forest -- and the equivalent XGBoost "
-        f"parameters -- were selected via cross-validated `RandomizedSearchCV` "
-        f"scored on Average Precision, not chosen by hand. The currently selected "
-        f"model in the sidebar is **{available_models[model_col]}**."
-    )
 
+# --------------------------------------------------------------------------- #
+# Dashboard Main Content Body
+# --------------------------------------------------------------------------- #
 left, right = st.columns([2.1, 1])
 
 with left:
     st.subheader(f"⚔️ Interactive Arena: {available_models[model_col]}")
 
+    # Top Central Cards: Active Model Cost & Recall
     m1, m2 = st.columns(2)
     delta_cost = current["cost"] - champion["cost"]
     m1.metric(
-        "Simulated Business Cost", f"${current['cost']:,}",
-        delta=f"${delta_cost:+,} vs cost-optimal threshold", delta_color="inverse",
+        f"{available_models[model_col]} Simulated Cost", 
+        f"${current['cost']:,}",
+        delta=f"${delta_cost:+,} vs cost-optimal threshold", 
+        delta_color="inverse",
     )
-    m2.metric("Recall (Defect Catch Rate)", f"{current['recall']*100:.1f}%")
+    m2.metric(f"{available_models[model_col]} Recall", f"{current['recall']*100:.1f}%")
 
+    # Dynamic Comparison Cards: Figures for all models at threshold t
+    st.markdown(f"**Model Cost Comparison @ t = {threshold:.2f}**")
+    cost_cols = st.columns(len(model_curves))
+    for i, (col, mc) in enumerate(model_curves.items()):
+        is_cheapest = col == cheapest_col and len(model_curves) > 1
+        cost_cols[i].metric(
+            f"{mc['label']} Cost",
+            f"${mc['cost_at_current']:,}",
+            delta="cheaper" if is_cheapest else None,
+            delta_color="normal",
+        )
+
+    # Central Financial Trajectory Graph
     st.subheader("📈 Financial Trajectory Matrix: Cost vs. Threshold Sweep")
-
     curve = go.Figure()
     palette = {"proba_rf": "#1E2761", "proba_xgb": "#F5A623"}
     dash = {"proba_rf": "solid", "proba_xgb": "dash"}
@@ -285,7 +261,7 @@ with left:
             line=dict(color=palette.get(col, "#6B7280"), width=3, dash=dash.get(col, "solid")),
         ))
     curve.add_vline(x=threshold, line_dash="dashdot", line_color="#C0392B", line_width=2,
-                     annotation_text=f"Current threshold ({threshold:.2f})", annotation_position="top")
+                    annotation_text=f"Current threshold ({threshold:.2f})", annotation_position="top")
     curve.update_layout(
         height=420,
         xaxis_title="Decision Threshold Boundary", yaxis_title="Total Financial Cost ($)",
@@ -294,28 +270,23 @@ with left:
     )
     st.plotly_chart(curve, use_container_width=True)
 
-    # Live cost of each model at exactly the current threshold -- updates on every slider move.
-    cost_cols = st.columns(len(model_curves))
-    for i, (col, mc) in enumerate(model_curves.items()):
-        is_cheapest = col == cheapest_col and len(model_curves) > 1
-        cost_cols[i].metric(
-            f"{mc['label']} cost @ t={threshold:.2f}",
-            f"${mc['cost_at_current']:,}",
-            delta="cheaper" if is_cheapest else None,
-            delta_color="normal",
-        )
-
-    with st.expander("📊 Confusion matrix for the selected model", expanded=False):
-        cm = [[current["tn"], current["fp"]], [current["fn"], current["tp"]]]
-        fig = go.Figure(data=go.Heatmap(
-            z=cm,
-            x=["Predicted Normal", "Predicted Defect"],
-            y=["Actual Normal", "Actual Defect"],
-            colorscale=[[0, "#EAF0FB"], [1, "#1E2761"]],
-            showscale=False, text=cm, texttemplate="%{text}", textfont={"size": 22},
-        ))
-        fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), yaxis_autorange="reversed")
-        st.plotly_chart(fig, use_container_width=True)
+    # Side-by-Side Confusion Matrices
+    with st.expander("📊 Dynamic Confusion Matrices (Side-by-Side)", expanded=False):
+        cm_cols = st.columns(len(available_models))
+        for idx, (col, label) in enumerate(available_models.items()):
+            with cm_cols[idx]:
+                st.markdown(f"**{label}**")
+                m = all_metrics_at_current[col]
+                cm = [[m["tn"], m["fp"]], [m["fn"], m["tp"]]]
+                fig = go.Figure(data=go.Heatmap(
+                    z=cm,
+                    x=["Predicted Normal", "Predicted Defect"],
+                    y=["Actual Normal", "Actual Defect"],
+                    colorscale=[[0, "#EAF0FB"], [1, palette.get(col, "#1E2761")]],
+                    showscale=False, text=cm, texttemplate="%{text}", textfont={"size": 18},
+                ))
+                fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10), yaxis_autorange="reversed")
+                st.plotly_chart(fig, use_container_width=True)
 
 with right:
     st.markdown(
@@ -360,54 +331,33 @@ with right:
     st.bar_chart(dist, use_container_width=True, color="#1E2761")
 
 st.markdown("---")
-st.markdown("**Detailed metrics at the current threshold**")
-st.table(pd.DataFrame({
-    "Metric": ["Recall", "Precision", "Specificity", "F1 Score", "Total cost"],
-    "Value": [
-        f"{current['recall']*100:.1f}%", f"{current['precision']*100:.1f}%",
-        f"{current['specificity']*100:.1f}%", f"{current['f1']*100:.1f}%",
-        f"${current['cost']:,}",
-    ],
-}).set_index("Metric"))
 
+# Side-by-Side Detailed Metrics Comparison Table
+st.markdown(f"**Detailed metrics comparison at t = {threshold:.2f}**")
+
+metrics_table_data = {"Metric": ["Recall", "Precision", "Specificity", "F1 Score", "Total Cost"]}
+for col, label in available_models.items():
+    m = all_metrics_at_current[col]
+    metrics_table_data[label] = [
+        f"{m['recall']*100:.1f}%",
+        f"{m['precision']*100:.1f}%",
+        f"{m['specificity']*100:.1f}%",
+        f"{m['f1']*100:.1f}%",
+        f"${m['cost']:,}",
+    ]
+
+st.table(pd.DataFrame(metrics_table_data).set_index("Metric"))
 
 # --------------------------------------------------------------------------- #
-# HOW TO EXPORT secom_model_params.json FROM YOUR NOTEBOOK
+# Base Section: Hyperparameters Collapsible Expander
 # --------------------------------------------------------------------------- #
-# Add this to the corrected pipeline notebook, after Sections 15/16 have
-# produced `best_rf_pipeline` and `xgb_pipeline`, alongside the existing
-# secom_test_predictions.csv export -- then drop the resulting JSON file
-# next to app.py:
-#
-#   import json
-#
-#   def safe_get_params(pipeline, step_name, keys):
-#       if step_name not in pipeline.named_steps:
-#           return {}
-#       p = pipeline.named_steps[step_name].get_params()
-#       return {k: p.get(k) for k in keys if k in p}
-#
-#   rf_params = {"Algorithm": "Random Forest (scikit-learn)"}
-#   rf_params.update(safe_get_params(best_rf_pipeline, "rf", [
-#       "n_estimators", "max_depth", "min_samples_split",
-#       "min_samples_leaf", "max_features", "random_state",
-#   ]))
-#   rf_params.update(safe_get_params(best_rf_pipeline, "impute", ["n_neighbors"]))
-#   if "winsorize" in best_rf_pipeline.named_steps:
-#       w = best_rf_pipeline.named_steps["winsorize"]
-#       rf_params["winsorize_lower_quantile"] = w.lower_quantile
-#       rf_params["winsorize_upper_quantile"] = w.upper_quantile
-#
-#   xgb_params = {"Algorithm": "XGBoost"}
-#   xgb_params.update(safe_get_params(xgb_pipeline, "xgb", [
-#       "n_estimators", "max_depth", "learning_rate",
-#       "subsample", "colsample_bytree", "random_state",
-#   ]))
-#
-#   with open("secom_model_params.json", "w") as f:
-#       json.dump({"proba_rf": rf_params, "proba_xgb": xgb_params}, f, indent=2)
-#
-# `safe_get_params` skips a pipeline step entirely if it isn't present, so
-# this works whether Section 13's extended search (with its own winsorizer
-# and tunable imputer) was adopted or the simpler Section 12 pipeline was
-# kept -- no manual editing required either way.
+with st.expander("🔧 Model Configuration — Hyperparameters & Architecture", expanded=False):
+    params_df = build_params_table(model_params, available_models)
+    st.dataframe(params_df, use_container_width=True)
+    st.caption(
+        f"Data source: {params_source_note}. `n_estimators`, `max_depth`, and "
+        f"`min_samples_leaf` for the Random Forest -- and the equivalent XGBoost "
+        f"parameters -- were selected via cross-validated `RandomizedSearchCV` "
+        f"scored on Average Precision, not chosen by hand. The currently selected "
+        f"model in the sidebar is **{available_models[model_col]}**."
+    )
