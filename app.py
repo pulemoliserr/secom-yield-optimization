@@ -179,8 +179,14 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Business Constraint**")
-    min_recall_pct = st.slider("Minimum Required Recall (SLA)", 0, 100, 0, 5,
-                                help="Restrict the 'cheapest threshold' search to thresholds that still catch at least this share of true defects.")
+    min_recall_pct = st.slider(
+        "Target Recall SLA Constraint (%)", 
+        min_value=0, 
+        max_value=100, 
+        value=80, 
+        step=1,
+        help="Finds the lowest-cost threshold (t) that guarantees at least this percentage of true defects are caught."
+    )
 
     st.divider()
     st.caption(f"Data source: {data_source_note}")
@@ -315,34 +321,41 @@ with right:
         f"""
         <div style="background:#FDF6D8;padding:1.1rem 1.3rem;border-radius:0.6rem;
                     border-left:5px solid #E8B923;">
-        <h4 style="margin-top:0;">🏆 Production Champion</h4>
-        <p style="font-size:0.9rem;">Cost-minimizing threshold found by sweeping this
-        model's probabilities against your current cost parameters.</p>
-        <ul style="font-size:0.9rem;">
-            <li><b>Champion cost:</b> ${champion['cost']:,}</li>
-            <li><b>Champion recall:</b> {champion['recall']*100:.1f}%</li>
-            <li><b>Cost-optimized threshold:</b> t = {best_t:.3f}</li>
+        <h4 style="margin-top:0;">🏆 Global Unconstrained Champion</h4>
+        <p style="font-size:0.88rem; margin-bottom:0.5rem;">Absolute lowest-cost threshold across all recall levels for this model.</p>
+        <ul style="font-size:0.88rem; padding-left:1.2rem; margin-bottom:0;">
+            <li><b>Cost-Optimal Threshold:</b> t = {best_t:.3f}</li>
+            <li><b>Minimum Cost:</b> ${champion['cost']:,}</li>
+            <li><b>Recall Achieved:</b> {champion['recall']*100:.1f}%</li>
         </ul>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if min_recall_pct > 0:
-        st.markdown(
-            f"""
-            <div style="background:#EAF6F2;padding:1.1rem 1.3rem;border-radius:0.6rem;
-                        border-left:5px solid #00A896;margin-top:0.8rem;">
-            <h4 style="margin-top:0;">🎯 Cheapest at {min_recall_pct}% Recall SLA</h4>
-            <ul style="font-size:0.9rem;">
-                <li><b>Cost:</b> ${champion_sla['cost']:,}</li>
-                <li><b>Recall achieved:</b> {champion_sla['recall']*100:.1f}%</li>
-                <li><b>Threshold:</b> t = {best_t_sla:.3f}</li>
-            </ul>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    # Dynamic SLA Card updating continuously with the SLA slider target
+    sla_card_title = (
+        f"🎯 Optimal Parameters @ {min_recall_pct}% Target Recall SLA"
+        if min_recall_pct > 0
+        else "🎯 Baseline (No SLA Target Applied)"
+    )
+
+    st.markdown(
+        f"""
+        <div style="background:#EAF6F2;padding:1.1rem 1.3rem;border-radius:0.6rem;
+                    border-left:5px solid #00A896;margin-top:0.8rem;">
+        <h4 style="margin-top:0;">{sla_card_title}</h4>
+        <ul style="font-size:0.88rem; padding-left:1.2rem; margin-bottom:0;">
+            <li><b>Required Threshold:</b> t = {best_t_sla:.3f}</li>
+            <li><b>Total Cost at SLA:</b> ${champion_sla['cost']:,}</li>
+            <li><b>Actual Recall Achieved:</b> {champion_sla['recall']*100:.1f}%</li>
+            <li><b>False Alarms (FP):</b> {champion_sla['fp']:,}</li>
+            <li><b>Missed Defects (FN):</b> {champion_sla['fn']:,}</li>
+        </ul>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.markdown("#####")
     st.markdown("**Class distribution in this test set**")
